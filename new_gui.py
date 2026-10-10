@@ -1,12 +1,12 @@
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
-import hashlib
 
 import keyboard
 from PyQt5.QtGui import QFont
@@ -86,36 +86,118 @@ STARTUP_TASK_DELAY_SECONDS = 5
 
 
 def parse_startup_args(argv=None):
-    """解析启动时可选的任务及其延迟时间。"""
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--start-task",
-        metavar="TASK",
-        help="启动后自动运行的任务 ID 或按钮名称，例如 IronBlood。",
+    """解析用于启动界面的可选脚本参数，选项名必须使用小写，参数不区分大小写。"""
+    args = argparse.Namespace(
+        start_task=False,
+        engine=None,
+        file=None,
+        start_delay=STARTUP_TASK_DELAY_SECONDS,
+        error=None,
     )
-    parser.add_argument(
-        "--start-delay",
-        type=int,
-        default=STARTUP_TASK_DELAY_SECONDS,
-        metavar="SECONDS",
-        help=f"任务启动前等待的秒数（默认：{STARTUP_TASK_DELAY_SECONDS}）。",
-    )
-    args = parser.parse_args(argv)
-    if args.start_delay < 0:
-        parser.error("--start-delay 必须是大于或等于 0 的整数")
+    seen = set()
+    values = sys.argv[1:] if argv is None else argv
+    try:
+        for value in values:
+            if value == "--start-task":
+                option = value
+                args.start_task = True
+            elif value.startswith("--engine:"):
+                option, _, option_value = value.partition(":")
+                if not option_value:
+                    raise ValueError("--engine: 后必须填写内核 ID")
+                args.engine = option_value
+            elif value.startswith("--file:"):
+                option, _, option_value = value.partition(":")
+                if not option_value:
+                    raise ValueError("--file: 后必须填写脚本名称")
+                args.file = option_value
+            elif value.startswith("--start-delay:"):
+                option, _, option_value = value.partition(":")
+                try:
+                    args.start_delay = int(option_value)
+                except ValueError as error:
+                    raise ValueError("--start-delay: 后必须填写非负整数") from error
+                if args.start_delay < 0:
+                    raise ValueError("--start-delay: 后必须填写非负整数")
+            else:
+                raise ValueError(f"不支持的启动参数：{value}")
 
-    if args.start_task:
-        registry = KernelRegistry()
-        search_target = args.start_task.lower()
-        spec = next(
-            (item for item in registry.runnable() if search_target == item.id.lower()),
-            None,
-        )
-        if spec is None:
-            available = ", ".join(item.id for item in registry.runnable())
-            parser.error(f"未知任务 {args.start_task!r}；可用任务 ID：{available}")
-        args.start_task = spec.id
+            if option in seen:
+                raise ValueError(f"参数重复：{option}")
+            seen.add(option)
+
+        if not args.start_task and seen:
+            raise ValueError("--engine:、--file: 和 --start-delay: 必须与 --start-task 一起使用")
+    except ValueError as error:
+        args.error = str(error)
+        args.start_task = False
     return args
+
+
+def resolve_startup_task(args):
+    """将命令行覆写值与设置文件合并为可运行的内核和脚本。"""
+    if not args.start_task:
+        return None
+
+    settings = load_settings()
+    registry = KernelRegistry()
+    configured_script = settings.get("script_file", "")
+    has_configured_script = isinstance(configured_script, str) and bool(configured_script)
+    if args.file is not None:
+        script_name = args.file
+    elif configured_script in (None, ""):
+        script_name = "insect.json"
+    elif has_configured_script:
+        script_name = configured_script
+    else:
+        raise ValueError("settings.json 中的 script_file 必须是脚本路径或名称")
+
+    default_engine = settings.get("script_engine", "") if has_configured_script else "IronBlood"
+    engine_name = args.engine or default_engine
+
+    if not isinstance(engine_name, str) or not engine_name:
+        raise ValueError("未设置可用内核；请在界面选择内核，或使用 --engine:ID 指定内核")
+    engine_key = engine_name.casefold()
+    spec = next(
+        (item for item in registry.runnable() if item.id.casefold() == engine_key),
+        None,
+    )
+    if spec is None:
+        available = ", ".join(item.id for item in registry.runnable())
+        raise ValueError(f"设置的内核不可用：{engine_name!r}；可用内核 ID：{available}")
+
+    if not isinstance(script_name, str) or not script_name:
+        raise ValueError("未设置可用脚本；请检查 settings.json 或使用 --file:SCRIPT 指定脚本")
+
+    scripts = discover_scripts(registry)
+    script_key_name = script_name.replace("\\", "/").casefold()
+    exact_matches = [path for path in scripts if script_key(path).casefold() == script_key_name]
+    if exact_matches:
+        matches = exact_matches
+    elif os.path.isabs(script_name) or "/" in script_name or "\\" in script_name:
+        path = script_path(script_name)
+        if not os.path.isfile(path):
+            raise ValueError(f"找不到脚本：{script_name}")
+        matches = [path]
+    else:
+        name = os.path.basename(script_name).casefold()
+        stem = os.path.splitext(name)[0]
+        matches = [
+            path for path in scripts
+            if path.name.casefold() == name or path.stem.casefold() == stem
+        ]
+
+    if len(matches) > 1:
+        raise ValueError(f"脚本名称不唯一，请使用相对路径指定：{script_name}")
+    if matches:
+        path = matches[0]
+    else:
+        path = script_path(script_name)
+        if not os.path.isfile(path):
+            raise ValueError(f"找不到脚本：{script_name}")
+
+    read_script(path)
+    return spec.id, str(path)
 
 
 def acquire_instance_lock(mutex_name):
@@ -321,7 +403,7 @@ class MainWindow(QMainWindowLog):
     hotkey_pressed = pyqtSignal(str)
     script_tool_result = pyqtSignal(str, object)
 
-    def __init__(self, start_task=None, start_delay=STARTUP_TASK_DELAY_SECONDS):
+    def __init__(self, startup_task=None, start_delay=STARTUP_TASK_DELAY_SECONDS):
         super().__init__()
         # 任务管理相关属性
         self.current_task = None
@@ -361,16 +443,18 @@ class MainWindow(QMainWindowLog):
 
         # 程序启动后先让界面完成显示，再按配置执行程序启动时触发的清理
         QTimer.singleShot(CLEANUP_STARTUP_DELAY_MS, lambda: self.cleanup_at("program_start"))
-        if start_task is not None:
-            spec = self.registry.specs[start_task]
+        if startup_task is not None:
+            engine_id, path = startup_task
+            spec = self.registry.specs[engine_id]
             CUS_LOGGER.debug(
-                "将在等待 %s 秒后，自动启动内核 %s。",
+                "将在等待 %s 秒后，使用内核 %s 运行脚本 %s。",
                 start_delay,
                 spec.id,
+                os.path.basename(path),
             )
             QTimer.singleShot(
                 start_delay * 1000,
-                lambda: self.run_kernel(start_task),
+                lambda: self.run_startup_task(engine_id, path),
             )
 
     def create_task_engine(self, kernel_id, *, script=False):
@@ -907,6 +991,14 @@ class MainWindow(QMainWindowLog):
         except (OSError, ValueError, RuntimeError) as error:
             QMessageBox.warning(self, "脚本无法启动", str(error))
 
+    def run_startup_task(self, kernel_id, path):
+        """运行启动参数解析出的脚本，并在 GUI 边界报告启动失败。"""
+        try:
+            self.launch_script(kernel_id, path)
+        except (OSError, ValueError, RuntimeError) as error:
+            CUS_LOGGER.error("启动任务失败：%s", error, exc_info=True)
+            QMessageBox.warning(self, "启动任务失败", str(error))
+
     def launch_script(self, kernel_id, path):
         """手动与计划任务共用入口；计划参数不修改当前下拉框选择。"""
         spec = self.registry.specs.get(kernel_id)
@@ -1382,6 +1474,8 @@ class MainWindow(QMainWindowLog):
 """
 
 def main(show, startup_args=None):
+    if startup_args is None:
+        startup_args = parse_startup_args([])
     root_path = os.path.normcase(os.path.realpath(PATHS["root"]))
     mutex_name = f"Local\\Simulated_Scepter_{hashlib.sha256(root_path.encode('utf-8')).hexdigest()}"
     mutex_handle = ctypes.windll.kernel32.OpenMutexW(0x00100000, False, mutex_name)
@@ -1436,11 +1530,30 @@ def main(show, startup_args=None):
             show_instance_warning()
             return
         app = QApplication.instance() or QApplication(sys.argv)
+        startup_task = None
+        startup_error = startup_args.error
+        if startup_error:
+            CUS_LOGGER.warning("启动参数无效，本次将正常启动程序但不执行自动任务：%s", startup_error)
+        else:
+            try:
+                startup_task = resolve_startup_task(startup_args)
+            except (OSError, ValueError) as error:
+                startup_error = str(error)
+                CUS_LOGGER.warning("启动任务配置无效，本次将正常启动程序但不执行自动任务：%s", error)
         window = MainWindow(
-            start_task=startup_args.start_task if startup_args else None,
-            start_delay=startup_args.start_delay if startup_args else STARTUP_TASK_DELAY_SECONDS,
+            startup_task=startup_task,
+            start_delay=startup_args.start_delay,
         )
         window.show()
+        if startup_error:
+            QTimer.singleShot(
+                0,
+                lambda: QMessageBox.warning(
+                    window,
+                    "启动任务未执行",
+                    f"{startup_error}\n\n程序将正常启动，但本次不会执行自动任务。",
+                ),
+            )
         try:
             sys.exit(app.exec())
         except SystemExit as e:
